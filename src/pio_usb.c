@@ -111,6 +111,7 @@ void __no_inline_not_in_flash_func(pio_usb_bus_send_token)(const pio_port_t *pp,
 void __no_inline_not_in_flash_func(pio_usb_bus_prepare_receive)(const pio_port_t *pp) {
   pio_sm_set_enabled(pp->pio_usb_rx, pp->sm_rx, false);
   pio_sm_clear_fifos(pp->pio_usb_rx, pp->sm_rx);
+  // Restart doesn't change the OSR.
   pio_sm_restart(pp->pio_usb_rx, pp->sm_rx);
   pio_sm_exec(pp->pio_usb_rx, pp->sm_rx, pp->rx_reset_instr);
   pio_sm_exec(pp->pio_usb_rx, pp->sm_rx, pp->rx_reset_instr2);

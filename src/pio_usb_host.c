@@ -31,6 +31,9 @@ static __unused uint32_t int_stat;
 
 static bool sof_timer(repeating_timer_t *_rt);
 
+
+extern int console_uart_printf(const char *fmt, ...);
+
 //--------------------------------------------------------------------+
 // Application API
 //--------------------------------------------------------------------+
@@ -500,6 +503,7 @@ static int __no_inline_not_in_flash_func(usb_in_transaction)(pio_port_t *pp,
     if ((pp->pio_usb_rx->irq & IRQ_RX_COMP_MASK) == 0) {
       res = -2;
     }
+    console_uart_printf("pio IN error\r\n");
     pio_usb_ll_transfer_complete(ep, PIO_USB_INTS_ENDPOINT_ERROR_BITS);
   }
 
@@ -537,6 +541,7 @@ static int __no_inline_not_in_flash_func(usb_out_transaction)(pio_port_t *pp,
   } else if (receive_token == USB_PID_STALL) {
     pio_usb_ll_transfer_complete(ep, PIO_USB_INTS_ENDPOINT_STALLED_BITS);
   } else {
+    console_uart_printf("pio OUT error\r\n");
     pio_usb_ll_transfer_complete(ep, PIO_USB_INTS_ENDPOINT_ERROR_BITS);
   }
 
@@ -564,17 +569,43 @@ static int __no_inline_not_in_flash_func(usb_setup_transaction)(
   // Data
   ep->data_id = 0; // set to DATA0
   pio_usb_bus_usb_transfer(pp, ep->buffer, 12);
+  gpio_put(13, true);
+
+  #define delay 0
+
+  // Same at 10, 15, 
+  // 0x51 0x00 at 20, 18
+  // 0x28 0x00 at 20, 18
+
+  for (size_t i = 0; i < delay; i++) {
+    asm("nop");
+  }
 
   // Handshake
   pio_usb_bus_start_receive(pp);
+  gpio_put(13, false);
   pio_usb_bus_wait_handshake(pp);
 
   ep->actual_len = 8;
 
   if (pp->usb_rx_buffer[0] == USB_SYNC && pp->usb_rx_buffer[1] == USB_PID_ACK) {
+    console_uart_printf("pio SETUP ok %03x %02x %02x\r\n", sof_count, pp->usb_rx_buffer[0], pp->usb_rx_buffer[1]);
     pio_usb_ll_transfer_complete(ep, PIO_USB_INTS_ENDPOINT_COMPLETE_BITS);
   } else {
     res = -1;
+    // >>> hex(514)
+    // '0x202'
+    // >>> bin(0xa)
+    // '0b1010'
+    // >>> bin(0x01a5)
+    // '0b110100101'
+    // >>> bin(0x0a5)
+    // '0b10100101'
+    // >>> bin(0xd2)
+    // '0b11010010'
+    // >>> 
+
+    console_uart_printf("pio SETUP error %03x %02x %02x delay %d\r\n", sof_count, pp->usb_rx_buffer[0], pp->usb_rx_buffer[1], delay);
     pio_usb_ll_transfer_complete(ep, PIO_USB_INTS_ENDPOINT_ERROR_BITS);
   }
 
