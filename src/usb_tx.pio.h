@@ -16,6 +16,7 @@
 
 #define usb_tx_dpdm_wrap_target 1
 #define usb_tx_dpdm_wrap 4
+#define usb_tx_dpdm_FJ_LK 1
 
 static const uint16_t __not_in_flash("tx_program") usb_tx_dpdm_program_instructions[] = {
     0xc700, //  0: irq    nowait 0        side 0 [7] 

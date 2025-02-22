@@ -13,6 +13,7 @@
 #include "hardware/dma.h"
 #include "hardware/pio.h"
 #include "hardware/pio_instructions.h"
+#include "hardware/structs/systick.h"
 #include "hardware/sync.h"
 #include "pico/bootrom.h"
 #include "pico/stdlib.h"
@@ -23,8 +24,6 @@
 #include "pio_usb_configuration.h"
 #include "pio_usb_ll.h"
 #include "usb_crc.h"
-#include "usb_tx.pio.h"
-#include "usb_rx.pio.h"
 
 #define UNUSED_PARAMETER(x) (void)x
 
@@ -42,8 +41,9 @@ static uint8_t pre_encoded[5];
 // Bus functions
 //--------------------------------------------------------------------+
 
-static void __no_inline_not_in_flash_func(send_pre)(const pio_port_t *pp) {
+static void __no_inline_not_in_flash_func(send_pre)(pio_port_t *pp) {
   // send PRE token in full-speed
+  pp->low_speed = false;
   uint16_t instr = pp->fs_tx_pre_program->instructions[0];
   pp->pio_usb_tx->instr_mem[pp->offset_tx] = instr;
 
@@ -60,6 +60,7 @@ static void __no_inline_not_in_flash_func(send_pre)(const pio_port_t *pp) {
   pio_sm_clear_fifos(pp->pio_usb_tx, pp->sm_tx);
 
   // change bus speed to low-speed
+  pp->low_speed = true;
   pio_sm_set_enabled(pp->pio_usb_tx, pp->sm_tx, false);
   instr = pp->fs_tx_program->instructions[0];
   pp->pio_usb_tx->instr_mem[pp->offset_tx] = instr;
@@ -75,7 +76,7 @@ static void __no_inline_not_in_flash_func(send_pre)(const pio_port_t *pp) {
   pio_sm_set_enabled(pp->pio_usb_rx, pp->sm_eop, true);
 }
 
-void __not_in_flash_func(pio_usb_bus_usb_transfer)(const pio_port_t *pp,
+void __not_in_flash_func(pio_usb_bus_usb_transfer)(pio_port_t *pp,
                                               uint8_t *data, uint16_t len) {
   if (pp->need_pre) {
     send_pre(pp);
@@ -96,7 +97,7 @@ void __not_in_flash_func(pio_usb_bus_usb_transfer)(const pio_port_t *pp,
 }
 
 void __no_inline_not_in_flash_func(pio_usb_bus_send_handshake)(
-    const pio_port_t *pp, uint8_t pid) {
+    pio_port_t *pp, uint8_t pid) {
   switch (pid) {
   case USB_PID_ACK:
     pio_usb_bus_usb_transfer(pp, ack_encoded, 5);
@@ -113,7 +114,7 @@ void __no_inline_not_in_flash_func(pio_usb_bus_send_handshake)(
   }
 }
 
-void __no_inline_not_in_flash_func(pio_usb_bus_send_token)(const pio_port_t *pp,
+void __no_inline_not_in_flash_func(pio_usb_bus_send_token)(pio_port_t *pp,
                                                            uint8_t token,
                                                            uint8_t addr,
                                                            uint8_t ep_num) {
@@ -139,88 +140,93 @@ void __no_inline_not_in_flash_func(pio_usb_bus_prepare_receive)(const pio_port_t
   pio_sm_set_enabled(pp->pio_usb_rx, pp->sm_rx, true);
 }
 
-void __no_inline_not_in_flash_func(pio_usb_bus_start_receive)(const pio_port_t *pp) {
-  pp->pio_usb_rx->irq = IRQ_RX_ALL_MASK;
+static uint8_t __no_inline_not_in_flash_func(pio_usb_bus_wait_packet)(pio_port_t* pp) {
+  uint16_t crc = 0xffff;
+  uint16_t crc_prev = 0xffff;
+  uint16_t crc_prev2 = 0xffff;
+  uint16_t crc_receive = 0xffff;
+  uint16_t crc_receive_inverse = 0;
+  bool crc_match = false;
+
+  const uint16_t rx_buf_len = sizeof(pp->usb_rx_buffer) / sizeof(pp->usb_rx_buffer[0]);
+
+  // Wait for the handshake to start.
+  // CircuitPython uses SysTick at CPU speed to measure between frames. So this
+  // value is always downcounting from the number of CPU cycles in a millisecond.
+  size_t ticks_per_bit = pp->low_speed ? pp->ticks_per_ls_bit: pp->ticks_per_fs_bit;
+  // Section 7.1.19.1: Hosts wait at least 18 bit times. Devices wait at least 16 but less than 18.
+  size_t bits_to_wait = pp->host ? 20 : 17;
+  size_t packet_start_timeout = systick_hw->cvr - bits_to_wait * ticks_per_bit;
+
+  while (systick_hw->cvr > packet_start_timeout) {
+    if ((pp->pio_usb_rx->irq & IRQ_RX_START_MASK) != 0) {
+      break;
+    }
+  }
+
+  // Timeout if we're not started.
+  if ((pp->pio_usb_rx->irq & IRQ_RX_START_MASK) == 0) {
+    return 0;
+  }
+
+  int16_t idx = 0;
+  // Wait 10 bit lengths to receive the next byte. (It should be 8.)
+  size_t token_timeout = systick_hw->cvr - 10 * ticks_per_bit;
+  while (systick_hw->cvr > token_timeout) {
+    if (pio_sm_get_rx_fifo_level(pp->pio_usb_rx, pp->sm_rx)) {
+      uint8_t data = pio_sm_get(pp->pio_usb_rx, pp->sm_rx) >> 24;
+      if (idx < rx_buf_len) {
+        pp->usb_rx_buffer[idx] = data;
+      }
+      token_timeout = systick_hw->cvr - 10 * ticks_per_bit;
+
+      if (idx >= 2) {
+          crc_prev2 = crc_prev;
+          crc_prev = crc;
+          crc = update_usb_crc16(crc, data);
+          crc_receive = (crc_receive >> 8) | (data << 8);
+          crc_receive_inverse = crc_receive ^ 0xffff;
+          crc_match = (crc_receive_inverse == crc_prev2);
+      }
+      idx++;
+    } else if ((pp->pio_usb_rx->irq & IRQ_RX_COMP_MASK) != 0) {
+      // Exit early if we've gotten an EOP. There *might* be a race between EOP
+      // detection and NRZI decoding but it is unlikely.
+      break;
+    }
+  }
+
+  if (idx >= 4 && !crc_match) {
+    // CRC failed, discard the packet.
+    return 0;
+  }
+  return idx;
 }
 
 uint8_t __no_inline_not_in_flash_func(pio_usb_bus_wait_handshake)(pio_port_t* pp) {
-  int16_t t = 240;
-  int16_t idx = 0;
 
-  while (t--) {
-    if (pio_sm_get_rx_fifo_level(pp->pio_usb_rx, pp->sm_rx)) {
-      uint8_t data = pio_sm_get(pp->pio_usb_rx, pp->sm_rx) >> 24;
-      pp->usb_rx_buffer[idx++] = data;
-      if (idx == 2) {
-        break;
-      }
-    }
+  uint8_t len = pio_usb_bus_wait_packet(pp);
+  if (len != 2) {
+    return 0;
   }
-
-  if (t > 0) {
-    while ((pp->pio_usb_rx->irq & IRQ_RX_COMP_MASK) == 0) {
-      continue;
-    }
-  }
-
- // pio_sm_set_enabled(pp->pio_usb_rx, pp->sm_rx, true);
 
   return pp->usb_rx_buffer[1];
 }
 
 int __no_inline_not_in_flash_func(pio_usb_bus_receive_packet_and_handshake)(
     pio_port_t *pp, uint8_t handshake) {
-  uint16_t crc = 0xffff;
-  uint16_t crc_prev = 0xffff;
-  uint16_t crc_prev2 = 0xffff;
-  uint16_t crc_receive = 0xffff;
-  uint16_t crc_receive_inverse;
-  bool crc_match = false;
-  int16_t t = 240;
-  uint16_t idx = 0;
-  uint16_t nak_timeout = 10000;
-  const uint16_t rx_buf_len = sizeof(pp->usb_rx_buffer) / sizeof(pp->usb_rx_buffer[0]);
-
-  while (t--) {
-    if (pio_sm_get_rx_fifo_level(pp->pio_usb_rx, pp->sm_rx)) {
-      uint8_t data = pio_sm_get(pp->pio_usb_rx, pp->sm_rx) >> 24;
-      pp->usb_rx_buffer[idx++] = data;
-      if (idx == 2) {
-        break;
-      }
-    }
+  uint8_t len = pio_usb_bus_wait_packet(pp);
+  if (len == 0) {
+    // Return and don't respond with a handshake.
+    return -1;
+  }
+  // Only handshake if the other end gave data.
+  if (len >= 4) {
+    pio_usb_bus_send_handshake(pp, handshake);
   }
 
-  // timing critical start
-  if (t > 0) {
-    if (handshake == USB_PID_ACK) {
-      while ((pp->pio_usb_rx->irq & IRQ_RX_COMP_MASK) == 0 && idx < rx_buf_len - 1) {
-        if (pio_sm_get_rx_fifo_level(pp->pio_usb_rx, pp->sm_rx)) {
-          uint8_t data = pio_sm_get(pp->pio_usb_rx, pp->sm_rx) >> 24;
-          crc_prev2 = crc_prev;
-          crc_prev = crc;
-          crc = update_usb_crc16(crc, data);
-          pp->usb_rx_buffer[idx++] = data;
-          crc_receive = (crc_receive >> 8) | (data << 8);
-          crc_receive_inverse = crc_receive ^ 0xffff;
-          crc_match = (crc_receive_inverse == crc_prev2);
-        }
-      }
-
-      if (idx >= 4 && crc_match) {
-        pio_usb_bus_send_handshake(pp, USB_PID_ACK);
-        // timing critical end
-        return idx - 4;
-      }
-    } else {
-      // just discard received data since we NAK/STALL anyway
-      while ((pp->pio_usb_rx->irq & IRQ_RX_COMP_MASK) == 0 && nak_timeout--) {
-        continue;
-      }
-      pio_sm_clear_fifos(pp->pio_usb_rx, pp->sm_rx);
-
-      pio_usb_bus_send_handshake(pp, handshake);
-    }
+  if (handshake == USB_PID_ACK) {
+    return len - 4;
   }
 
   return -1;
@@ -244,8 +250,9 @@ static void __no_inline_not_in_flash_func(initialize_host_programs)(
   pp->offset_tx = 0;
   usb_tx_fs_program_init(pp->pio_usb_tx, pp->sm_tx, pp->offset_tx, port->pin_dp,
                          port->pin_dm);
-  pp->tx_start_instr = pio_encode_jmp(pp->offset_tx + 4);
-  pp->tx_reset_instr = pio_encode_jmp(pp->offset_tx + 2);
+  uint32_t sideset_fj_lk = pio_encode_sideset(2, usb_tx_dpdm_FJ_LK);
+  pp->tx_start_instr = pio_encode_jmp(pp->offset_tx + 4) | sideset_fj_lk;
+  pp->tx_reset_instr = pio_encode_jmp(pp->offset_tx + 2) | sideset_fj_lk;
 
   add_pio_host_rx_program(pp->pio_usb_rx, &usb_nrzi_decoder_program,
                           &usb_nrzi_decoder_debug_program, &pp->offset_rx,
@@ -346,6 +353,10 @@ void pio_usb_bus_init(pio_port_t *pp, const pio_usb_configuration_t *c,
   root->initialized = true;
   root->dev_addr = 0;
 
+  uint32_t core_clock_hz = clock_get_hz(clk_sys);
+  pp->ticks_per_fs_bit = core_clock_hz / 12000000;
+  pp->ticks_per_ls_bit = core_clock_hz / 1500000;
+
   // pre-encode handshake packets
   uint8_t raw_packet[] = {USB_SYNC, USB_PID_ACK};
   pio_usb_ll_encode_tx_data(raw_packet, 2, ack_encoded);
@@ -422,11 +433,11 @@ uint8_t __no_inline_not_in_flash_func(pio_usb_ll_encode_tx_data)(
   int current_state = 1;
   int bit_stuffing = 6;
   for (int idx = 0; idx < buffer_len; idx++) {
-    uint8_t byte = buffer[idx];
+    uint8_t data_byte = buffer[idx];
     for (int b = 0; b < 8; b++) {
       uint8_t byte_idx = bit_idx >> 2;
       encoded_data[byte_idx] <<= 2;
-      if (byte & (1 << b)) {
+      if (data_byte & (1 << b)) {
         if (current_state) {
           encoded_data[byte_idx] |= PIO_USB_TX_ENCODED_DATA_K;
         } else {

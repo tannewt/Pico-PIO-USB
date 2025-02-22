@@ -196,7 +196,7 @@ static inline void usb_rx_fs_program_init(PIO pio, uint sm, uint offset, uint pi
   }
   sm_config_set_in_pins(&c, pin_dp);  // for WAIT, IN
   sm_config_set_jmp_pin(&c, pin_dp);  // for JMP
-  // Shift to right, autopull enabled, 8bit
+  // Shift to right, autopush enabled, 8bit
   sm_config_set_in_shift(&c, true, true, 8);
   sm_config_set_fifo_join(&c, PIO_FIFO_JOIN_RX);
   pio_sm_init(pio, sm, offset, &c);
