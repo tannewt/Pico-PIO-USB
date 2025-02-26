@@ -35,7 +35,6 @@ static uint8_t ack_encoded[5];
 static uint8_t nak_encoded[5];
 static uint8_t stall_encoded[5];
 static uint8_t pre_encoded[5];
-static uint8_t wait_encoded[5];
 
 //--------------------------------------------------------------------+
 // Bus functions
@@ -150,36 +149,19 @@ static uint8_t __no_inline_not_in_flash_func(pio_usb_bus_wait_packet)(pio_port_t
 
   const uint16_t rx_buf_len = sizeof(pp->usb_rx_buffer) / sizeof(pp->usb_rx_buffer[0]);
 
-  if (pp->pio_usb_tx->dbg_padoe != 0) {
+  if ((pp->pio_usb_tx->dbg_padoe & 0x6) != 0) {
     gpio_put(8, 1);
     gpio_put(8, 0);
   }
 
-  // Wait for the handshake to start by "transmitting" a fake set of bits. They
-  // aren't output to the pins. We just use it for timing.
-  dma_channel_abort(pp->tx_ch);
-  pio_sm_clear_fifos(pp->pio_usb_tx, pp->sm_tx);
-  dma_channel_transfer_from_buffer_now(pp->tx_ch, wait_encoded,
-                                       sizeof(wait_encoded));
-  pp->pio_usb_tx->irq = IRQ_TX_ALL_MASK;       // clear complete flag
-
   gpio_put(7, 1);
-  while ((pp->pio_usb_tx->irq & IRQ_TX_EOP_MASK) == 0) {
+  uint32_t start = time_us_32();
+  uint32_t timeout = pp->low_speed? 20 : 3;
+  while (time_us_32() - start <= timeout) {
     if ((pp->pio_usb_rx->irq & IRQ_RX_START_MASK) != 0) {
       break;
     }
   }
-  dma_channel_abort(pp->tx_ch);
-  while (dma_channel_is_busy(pp->tx_ch)) {
-    continue;
-  }
-  pio_sm_clear_fifos(pp->pio_usb_tx, pp->sm_tx);
-  // Wait for the OSR to drain. Otherwise we may set the irq accidentally
-  // after clearing.
-  while ((pp->pio_usb_tx->fdebug & PIO_FDEBUG_TXSTALL_BITS) == 0) {
-    continue;
-  }
-  pp->pio_usb_tx->fdebug = PIO_FDEBUG_TXSTALL_BITS;
   gpio_put(7, 0);
 
   // Timeout if we're not started.
@@ -189,14 +171,19 @@ static uint8_t __no_inline_not_in_flash_func(pio_usb_bus_wait_packet)(pio_port_t
     return 0;
   }
 
+  if ((pp->pio_usb_rx->irq & IRQ_RX_COMP_MASK) != 0) {
+    gpio_put(8, 1);
+    gpio_put(8, 0);
+  }
+
   int16_t idx = 0;
   // Timeout in seven microseconds. That is enough time to receive one byte at
   // low speed. This is to detect packets without an EOP because the device was
   // unplugged.
-  uint32_t start = time_us_32();
+  start = time_us_32();
   while (time_us_32() - start <= 7) {
     if (pio_sm_get_rx_fifo_level(pp->pio_usb_rx, pp->sm_rx)) {
-      gpio_put(6, 1);
+      gpio_put(7, 1);
       uint8_t data = pio_sm_get(pp->pio_usb_rx, pp->sm_rx) >> 24;
       if (idx < rx_buf_len) {
         pp->usb_rx_buffer[idx] = data;
@@ -212,7 +199,7 @@ static uint8_t __no_inline_not_in_flash_func(pio_usb_bus_wait_packet)(pio_port_t
           crc_match = (crc_receive_inverse == crc_prev2);
       }
       idx++;
-      gpio_put(6, 0);
+      gpio_put(7, 0);
     } else if ((pp->pio_usb_rx->irq & IRQ_RX_COMP_MASK) != 0) {
       // Exit early if we've gotten an EOP. There *might* be a race between EOP
       // detection and NRZI decoding but it is unlikely.
@@ -400,24 +387,6 @@ void pio_usb_bus_init(pio_port_t *pp, const pio_usb_configuration_t *c,
   pio_usb_ll_encode_tx_data(raw_packet, 2, stall_encoded);
   raw_packet[1] = USB_PID_PRE;
   pio_usb_ll_encode_tx_data(raw_packet, 2, pre_encoded);
-
-  // Encode wait for response
-
-  // Fill the buffer with Ks
-  for (size_t i = 0; i < sizeof(wait_encoded); i++) {
-    wait_encoded[i] = PIO_USB_TX_ENCODED_DATA_K << 6 |
-                      PIO_USB_TX_ENCODED_DATA_K << 4 |
-                      PIO_USB_TX_ENCODED_DATA_K << 2 |
-                      PIO_USB_TX_ENCODED_DATA_K;
-  }
-  // Replace our timeout with the interrupt (which is instruction 0)
-  if (root->mode == PIO_USB_MODE_HOST) {
-    // Hosts wait 18+ bit times. We do 20.
-    wait_encoded[4] &= 0xfc;
-  } else {
-    // devices wait 17 bit times.
-    wait_encoded[4] &= 0x3f;
-  }
 }
 
 //--------------------------------------------------------------------+

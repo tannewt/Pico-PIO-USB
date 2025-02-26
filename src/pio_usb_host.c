@@ -625,6 +625,8 @@ static int __no_inline_not_in_flash_func(usb_setup_transaction)(
     ep->actual_len = 8;
     pio_usb_ll_transfer_complete(ep, PIO_USB_INTS_ENDPOINT_COMPLETE_BITS);
   } else {
+    gpio_put(8, 1);
+    gpio_put(8, 0);
     res = -1;
     ep->data_id = USB_PID_SETUP; // retry setup
     if (++ep->failed_count > TRANSACTION_MAX_RETRY) {
