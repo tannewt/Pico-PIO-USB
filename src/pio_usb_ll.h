@@ -152,7 +152,9 @@ pio_usb_bus_get_line_state(root_port_t *root) {
 }
 
 static __always_inline void pio_usb_bus_start_receive(const pio_port_t *pp) {
+  gpio_put(6, 1);
   pp->pio_usb_rx->irq = IRQ_RX_ALL_MASK;
+  gpio_put(6, 0);
 }
 
 //--------------------------------------------------------------------+

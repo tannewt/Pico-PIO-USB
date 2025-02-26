@@ -214,8 +214,8 @@ static void __no_inline_not_in_flash_func(restore_fs_bus)(pio_port_t *pp) {
 
 // Time about 1us ourselves so it lives in RAM.
 static void __not_in_flash_func(busy_wait_1_us)(void) {
-  uint32_t start = timer_hw->timerawl;
-  while (timer_hw->timerawl == start) {
+  uint32_t start = time_us_32();
+  while (time_us_32() == start) {
       tight_loop_contents();
   }
 }
@@ -543,6 +543,8 @@ static int __no_inline_not_in_flash_func(usb_in_transaction)(pio_port_t *pp,
     if ((pp->pio_usb_rx->irq & IRQ_RX_COMP_MASK) == 0) {
       res = -2;
     }
+    gpio_put(8, 1);
+    gpio_put(8, 0);
 
     if (++ep->failed_count > TRANSACTION_MAX_RETRY) {
       pio_usb_ll_transfer_complete(ep, PIO_USB_INTS_ENDPOINT_ERROR_BITS); // failed after 3 consecutive retries
